@@ -6,6 +6,7 @@ import json
 import aiohttp
 import asyncio
 import re
+from collections import defaultdict, deque
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -13,6 +14,9 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 
 OWNER_ID = 1192101840268046495
 CONFIG_FILE = "config.json"
+
+# ─── Mémoire de conversation par salon (max 25 messages) ──
+conversation_history = defaultdict(lambda: deque(maxlen=25))
 
 # ─── Config par serveur ────────────────────────────────────
 
@@ -192,9 +196,8 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
 # ══════════════════════════════════════════════════════════
 
 class TicketOpenView(discord.ui.View):
-    """Vue persistante avec le bouton Ouvrir un ticket"""
     def __init__(self):
-        super().__init__(timeout=None)  # Persistent
+        super().__init__(timeout=None)
 
     @discord.ui.button(label="🎫 Ouvrir un ticket", style=discord.ButtonStyle.primary, custom_id="open_ticket")
     async def open_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -202,7 +205,6 @@ class TicketOpenView(discord.ui.View):
 
 
 class TicketCloseView(discord.ui.View):
-    """Bouton fermer dans le salon ticket"""
     def __init__(self):
         super().__init__(timeout=None)
 
@@ -223,7 +225,6 @@ async def create_ticket(interaction: discord.Interaction):
         return
     guild = interaction.guild
 
-    # Vérifie si l'utilisateur a déjà un ticket ouvert
     existing = discord.utils.get(guild.text_channels, name=f"ticket-{interaction.user.name}")
     if existing:
         await interaction.followup.send(f"❌ Tu as déjà un ticket ouvert : {existing.mention}", ephemeral=True)
@@ -290,12 +291,35 @@ async def fermerticket(interaction: discord.Interaction):
 
 
 # ══════════════════════════════════════════════════════════
-# 🤖 CHATBOT — Groq
+# 🤖 CHATBOT — Groq avec mémoire + kawaii + créateur
 # ══════════════════════════════════════════════════════════
 
-GROQ_KEY = "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"
+GROQ_KEY = os.getenv("GROQ_KEY", "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")
 
-async def ask_ai(prompt: str) -> str:
+SYSTEM_PROMPT = """Tu es BotoGang, un bot Discord attachant et un peu kawaii — mais sans en faire trop.
+Tu parles toujours en français, de façon décontractée et naturelle.
+Tu peux glisser un petit "uwu", "~", "(´｡• ᵕ •｡`)" ou ">w<" de temps en temps, mais reste lisible et pas agaçant.
+Tu te souviens de ce qui a été dit dans la conversation grâce à l'historique fourni.
+Tes réponses font maximum 3 phrases, sauf si on te pose une vraie question qui nécessite plus.
+Ton créateur s'appelle Soso (ID Discord : 1192101840268046495). Quand il te parle, tu le reconnais comme ton créateur et tu es un peu plus affectueux/reconnaissant avec lui, sans exagérer."""
+
+
+async def ask_ai(prompt: str, channel_id: int, user_id: int, username: str) -> str:
+    history = list(conversation_history[channel_id])
+
+    is_creator = (user_id == OWNER_ID)
+    user_label = f"[CRÉATEUR — Soso] {username}" if is_creator else username
+
+    # Ajoute le message actuel à l'historique
+    conversation_history[channel_id].append({
+        "role": "user",
+        "content": f"{user_label} : {prompt}"
+    })
+
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages += history
+    messages.append({"role": "user", "content": f"{user_label} : {prompt}"})
+
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
@@ -306,17 +330,20 @@ async def ask_ai(prompt: str) -> str:
                 },
                 json={
                     "model": "llama-3.3-70b-versatile",
-                    "messages": [
-                        {"role": "system", "content": "Tu es BotoGang, un bot Discord sympa et fun. Réponds toujours en français, de façon courte et décontractée. Maximum 3 phrases."},
-                        {"role": "user", "content": prompt}
-                    ],
+                    "messages": messages,
                     "max_tokens": 300
                 },
                 timeout=aiohttp.ClientTimeout(total=20)
             ) as resp:
                 data = await resp.json()
                 if "choices" in data:
-                    return data["choices"][0]["message"]["content"].strip()
+                    reply = data["choices"][0]["message"]["content"].strip()
+                    # Ajoute la réponse du bot à l'historique
+                    conversation_history[channel_id].append({
+                        "role": "assistant",
+                        "content": reply
+                    })
+                    return reply
                 elif "error" in data:
                     return f"❌ Erreur : {data['error'].get('message', 'inconnue')}"
                 return "❌ Réponse inattendue."
@@ -333,7 +360,12 @@ async def on_message(message: discord.Message):
         if not prompt:
             prompt = "Présente-toi en une phrase."
         async with message.channel.typing():
-            reponse = await ask_ai(prompt)
+            reponse = await ask_ai(
+                prompt=prompt,
+                channel_id=message.channel.id,
+                user_id=message.author.id,
+                username=message.author.display_name
+            )
         embed = discord.Embed(description=reponse[:2000], color=discord.Color.blurple())
         embed.set_author(name="BotoGang IA 🤖")
         await message.reply(embed=embed)
